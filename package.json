@@ -1,0 +1,8 @@
+﻿{
+  "name": "tethro-credential-proxy",
+  "version": "0.9.4",
+  "description": "Credential isolation proxy for AI agents. Agents never see your real API keys.",
+  "scripts": { "dev": "bun --hot src/index.js", "start": "bun src/index.js" },
+  "repository": { "type": "git", "url": "https://github.com/tethro/tethro-credential-proxy" },
+  "license": "Apache-2.0"
+}
