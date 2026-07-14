@@ -1,8 +1,9 @@
 ﻿# tethro-credential-proxy
 
-Credential isolation proxy for AI agents. Agents never see your real API keys — a per-session scoped proxy key is injected into outbound requests, rate-limited and revocable. Supports Anthropic + OpenAI.
+HTTP proxy that keeps model API keys off the agent process. Agents get a per-session scoped key; this service swaps in the real Anthropic/OpenAI key from the host environment, with basic rate limiting and revocation.
 
 ```bash
+export ANTHROPIC_API_KEY=...
 bun src/index.js
 ```
 
