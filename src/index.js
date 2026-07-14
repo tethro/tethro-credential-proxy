@@ -1,8 +1,8 @@
 /**
- * Airlock Credential Isolation Proxy
+ * Tethro Credential Isolation Proxy
  *
  * A real HTTP proxy that sits between sandboxed agents and model APIs.
- * Agents see ANTHROPIC_API_KEY=airlock-session-proxy in their environment.
+ * Agents see ANTHROPIC_API_KEY=tethro-session-proxy in their environment.
  * This proxy intercepts the request, replaces the proxy key with the real
  * API key (from the host environment), and forwards to the real API.
  *
@@ -40,7 +40,7 @@ function log(msg, level = "info") {
 // ─── Session key management ───
 
 function createSessionKey(provider, sessionId) {
-  const key = `airlock-session-${sessionId}-${Date.now().toString(36)}`;
+  const key = `tethro-session-${sessionId}-${Date.now().toString(36)}`;
   sessionKeys.set(key, {
     provider,
     sessionId,
@@ -101,7 +101,7 @@ function handleProxy(req, res) {
     return;
   }
 
-  // ─── Create session key (called by airlock-cli when starting a session) ───
+  // ─── Create session key (called by tethro-cli when starting a session) ───
   if (req.method === "POST" && url.pathname === "/session/create") {
     let body = "";
     req.on("data", (c) => (body += c));
