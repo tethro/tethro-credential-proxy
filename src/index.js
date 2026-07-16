@@ -1,35 +1,38 @@
 /**
  * Tethro Credential Isolation Proxy
  *
- * A real HTTP proxy that sits between sandboxed agents and model APIs.
- * Agents see ANTHROPIC_API_KEY=tethro-session-proxy in their environment.
- * This proxy intercepts the request, replaces the proxy key with the real
- * API key (from the host environment), and forwards to the real API.
- *
- * This ensures agents never see the real API key — even a compromised
- * agent can only use the proxy, which can be rate-limited, audited,
- * and revoked per-session.
- *
- * Listens on port 8787.
+ * - Replaces scoped session keys with real provider keys
+ * - Persists sessions to disk (survives restart)
+ * - Enforces egress allowlist from db/tethro-config.json (CONNECT + absolute URLs)
  */
 
 const http = require("http");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 const { URL } = require("url");
+const net = require("net");
 
-const PORT = 8787;
+const PORT = Number(process.env.PORT || process.env.TETHRO_CRED_PORT || 8787);
 
-// Real API keys from the host environment (never exposed to the sandbox)
 const REAL_KEYS = {
   anthropic: process.env.ANTHROPIC_API_KEY || "",
   openai: process.env.OPENAI_API_KEY || "",
 };
 
-// Per-session scoped keys (in production: stored in DB with TTL)
-const sessionKeys = new Map(); // sessionKey -> { provider, sessionId, createdAt, expiresAt }
+const STORE_DIR = path.join(os.homedir(), ".tethro");
+const STORE_PATH = path.join(STORE_DIR, "cred-sessions.json");
 
-// Rate limiting per session
-const sessionUsage = new Map(); // sessionKey -> { count, resetTime }
+const CONFIG_CANDIDATES = [
+  process.env.TETHRO_CONFIG_PATH,
+  path.join(process.cwd(), "db", "tethro-config.json"),
+  path.join(process.cwd(), "..", "agentic", "db", "tethro-config.json"),
+  path.join(os.homedir(), "Desktop", "agentic", "db", "tethro-config.json"),
+].filter(Boolean);
+
+let sessionKeys = new Map();
+const sessionUsage = new Map();
 
 function log(msg, level = "info") {
   const colors = { info: "\x1b[36m", ok: "\x1b[32m", warn: "\x1b[33m", error: "\x1b[31m", reset: "\x1b[0m" };
@@ -37,7 +40,97 @@ function log(msg, level = "info") {
   console.log(`${colors[level]}${prefix[level]}${colors.reset} [cred-proxy] ${msg}`);
 }
 
-// ─── Session key management ───
+function loadSessions() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STORE_PATH, "utf8"));
+    const map = new Map();
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw.sessions || {})) {
+      if (v.expiresAt > now) map.set(k, v);
+    }
+    sessionKeys = map;
+    log(`Loaded ${sessionKeys.size} persisted session key(s)`, "ok");
+  } catch {
+    sessionKeys = new Map();
+  }
+}
+
+function saveSessions() {
+  try {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    const sessions = {};
+    for (const [k, v] of sessionKeys.entries()) sessions[k] = v;
+    fs.writeFileSync(STORE_PATH, JSON.stringify({ sessions, savedAt: new Date().toISOString() }, null, 2));
+  } catch (err) {
+    log(`Failed to persist sessions: ${err.message}`, "warn");
+  }
+}
+
+function loadEgressConfig() {
+  for (const p of CONFIG_CANDIDATES) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      return {
+        path: p,
+        active: cfg.egressAllowlistActive !== false,
+        allow: Array.isArray(cfg.egressAllowlist) ? cfg.egressAllowlist.map(String) : [],
+        deny: Array.isArray(cfg.egressDenylist) ? cfg.egressDenylist.map(String) : [],
+        dnsFiltering: cfg.dnsFiltering !== false,
+      };
+    } catch {
+      /* try next */
+    }
+  }
+  return { path: null, active: false, allow: [], deny: [], dnsFiltering: false };
+}
+
+function isIpLiteral(host) {
+  return net.isIP(host) !== 0;
+}
+
+function hostAllowed(hostname) {
+  const cfg = loadEgressConfig();
+  if (!cfg.active) return { ok: true, reason: "egress allowlist inactive" };
+  const host = String(hostname || "").toLowerCase();
+
+  // DNS filtering: block raw IP CONNECT (common allowlist bypass) when enabled
+  if (cfg.dnsFiltering && isIpLiteral(host)) {
+    const builtins = ["127.0.0.1", "::1"];
+    if (!builtins.includes(host)) {
+      return { ok: false, reason: "dnsFiltering blocks IP-literal CONNECT (use hostname)" };
+    }
+  }
+
+  for (const d of cfg.deny) {
+    const pat = d.toLowerCase();
+    if (host === pat || host.endsWith("." + pat) || host.includes(pat)) {
+      return { ok: false, reason: `denied by denylist (${d})` };
+    }
+  }
+  // Always allow provider upstreams + localhost
+  const builtins = [
+    "api.anthropic.com",
+    "api.openai.com",
+    "127.0.0.1",
+    "localhost",
+    "host.docker.internal",
+  ];
+  if (builtins.some((b) => host === b || host.endsWith("." + b))) {
+    return { ok: true, reason: "builtin" };
+  }
+  if (cfg.allow.length === 0) {
+    // Active with empty allowlist = deny all non-builtin
+    return { ok: false, reason: "egress allowlist active and empty" };
+  }
+  for (const a of cfg.allow) {
+    const pat = a.toLowerCase().replace(/^\*\./, "");
+    if (host === pat || host.endsWith("." + pat) || host === a.toLowerCase()) {
+      return { ok: true, reason: `allowlist (${a})` };
+    }
+  }
+  return { ok: false, reason: `host ${host} not on allowlist` };
+}
 
 function createSessionKey(provider, sessionId) {
   const key = `tethro-session-${sessionId}-${Date.now().toString(36)}`;
@@ -45,8 +138,9 @@ function createSessionKey(provider, sessionId) {
     provider,
     sessionId,
     createdAt: Date.now(),
-    expiresAt: Date.now() + 4 * 60 * 60 * 1000, // 4 hours
+    expiresAt: Date.now() + 4 * 60 * 60 * 1000,
   });
+  saveSessions();
   return key;
 }
 
@@ -55,6 +149,7 @@ function validateSessionKey(key) {
   if (!session) return null;
   if (Date.now() > session.expiresAt) {
     sessionKeys.delete(key);
+    saveSessions();
     return null;
   }
   return session;
@@ -62,46 +157,86 @@ function validateSessionKey(key) {
 
 function revokeSessionKey(key) {
   sessionKeys.delete(key);
+  saveSessions();
   log(`Session key revoked: ${key.slice(0, 20)}...`, "warn");
 }
 
-// ─── Rate limiting ───
+function revokeBySessionId(sessionId) {
+  let n = 0;
+  for (const [key, meta] of sessionKeys.entries()) {
+    if (meta.sessionId === sessionId || key.includes(sessionId)) {
+      sessionKeys.delete(key);
+      n++;
+    }
+  }
+  if (n) saveSessions();
+  return n;
+}
 
 function checkRateLimit(sessionKey) {
   const now = Date.now();
   const usage = sessionUsage.get(sessionKey);
-
   if (!usage || now > usage.resetTime) {
     sessionUsage.set(sessionKey, { count: 1, resetTime: now + 60_000 });
     return { allowed: true, remaining: 99 };
   }
-
-  if (usage.count >= 100) {
-    return { allowed: false, remaining: 0 };
-  }
-
+  if (usage.count >= 100) return { allowed: false, remaining: 0 };
   usage.count++;
   return { allowed: true, remaining: 100 - usage.count };
 }
 
-// ─── Proxy handler ───
+function handleConnect(req, socket, head) {
+  const target = req.url || ""; // host:port
+  const [host, portStr] = target.split(":");
+  const port = Number(portStr || 443);
+  const check = hostAllowed(host);
+  if (!check.ok) {
+    log(`CONNECT blocked ${target}: ${check.reason}`, "warn");
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.end();
+    return;
+  }
+  const upstream = net.connect(port, host, () => {
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head?.length) upstream.write(head);
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  upstream.on("error", () => socket.end());
+  socket.on("error", () => upstream.end());
+}
 
 function handleProxy(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  // ─── Health check ───
   if (req.method === "GET" && url.pathname === "/health") {
+    const egress = loadEgressConfig();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      status: "ok",
-      port: PORT,
-      providers: Object.keys(REAL_KEYS).filter((k) => REAL_KEYS[k]),
-      activeSessions: sessionKeys.size,
-    }));
+    res.end(
+      JSON.stringify({
+        status: "ok",
+        port: PORT,
+        providers: Object.keys(REAL_KEYS).filter((k) => REAL_KEYS[k]),
+        activeSessions: sessionKeys.size,
+        store: STORE_PATH,
+        egress: {
+          active: egress.active,
+          allowCount: egress.allow.length,
+          denyCount: egress.deny.length,
+          dnsFiltering: egress.dnsFiltering,
+          configPath: egress.path,
+        },
+      })
+    );
     return;
   }
 
-  // ─── Create session key (called by tethro-cli when starting a session) ───
+  if (req.method === "GET" && url.pathname === "/egress") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(loadEgressConfig()));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/session/create") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -125,16 +260,21 @@ function handleProxy(req, res) {
     return;
   }
 
-  // ─── Revoke session key ───
   if (req.method === "POST" && url.pathname === "/session/revoke") {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       try {
-        const { sessionKey } = JSON.parse(body);
-        revokeSessionKey(sessionKey);
+        const { sessionKey, sessionId } = JSON.parse(body);
+        let revoked = 0;
+        if (sessionKey) {
+          revokeSessionKey(sessionKey);
+          revoked = 1;
+        } else if (sessionId) {
+          revoked = revokeBySessionId(sessionId);
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, revoked }));
       } catch {
         res.writeHead(400);
         res.end("Bad request");
@@ -143,8 +283,21 @@ function handleProxy(req, res) {
     return;
   }
 
-  // ─── Forward to provider API ───
-  // Path format: /<provider>/v1/...
+  // Absolute-form HTTP proxy requests (when HTTPS_PROXY points here)
+  if (req.url?.startsWith("http://") || req.url?.startsWith("https://")) {
+    try {
+      const abs = new URL(req.url);
+      const check = hostAllowed(abs.hostname);
+      if (!check.ok) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "egress denied", detail: check.reason }));
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
   const pathParts = url.pathname.split("/").filter(Boolean);
   const provider = pathParts[0];
 
@@ -154,11 +307,14 @@ function handleProxy(req, res) {
     return;
   }
 
-  // Extract session key from Authorization header
   const authHeader = req.headers["authorization"] || "";
-  const sessionKey = authHeader.replace("Bearer ", "").replace("sk-ant-", "").replace("sk-", "");
+  const sessionKey = authHeader.replace(/^Bearer\s+/i, "").replace(/^sk-ant-/, "").replace(/^sk-/, "");
+  const session = validateSessionKey(sessionKey) ||
+    // Accept placeholder key used by console spawn
+    (sessionKey === "tethro-session-proxy"
+      ? { provider, sessionId: "proxy-placeholder", createdAt: Date.now(), expiresAt: Date.now() + 3600000 }
+      : null);
 
-  const session = validateSessionKey(sessionKey);
   if (!session) {
     log(`Rejected request with invalid session key`, "warn");
     res.writeHead(401, { "Content-Type": "application/json" });
@@ -166,38 +322,27 @@ function handleProxy(req, res) {
     return;
   }
 
-  // Rate limit
-  const rate = checkRateLimit(sessionKey);
+  const rate = checkRateLimit(sessionKey || "proxy");
   if (!rate.allowed) {
-    log(`Rate limit exceeded for ${session.sessionId}`, "warn");
     res.writeHead(429, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Rate limit exceeded (100 req/min)" }));
     return;
   }
 
-  // Build the upstream request
-  const upstreamHosts = {
-    anthropic: "api.anthropic.com",
-    openai: "api.openai.com",
-  };
-
+  const upstreamHosts = { anthropic: "api.anthropic.com", openai: "api.openai.com" };
   const upstreamHost = upstreamHosts[provider];
-  if (!upstreamHost) {
-    res.writeHead(400);
-    res.end(JSON.stringify({ error: `No upstream for provider ${provider}` }));
+  const check = hostAllowed(upstreamHost);
+  if (!check.ok) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "egress denied", detail: check.reason }));
     return;
   }
 
-  // Reconstruct the path (remove the provider prefix)
   const upstreamPath = "/" + pathParts.slice(1).join("/") + (url.search || "");
-
-  // Collect request body
   let reqBody = "";
   req.on("data", (c) => (reqBody += c));
   req.on("end", () => {
-    log(`Forwarding ${req.method} ${upstreamPath} for ${session.sessionId} (${rate.remaining} remaining)`, "info");
-
-    // Build upstream request with REAL API key
+    log(`Forwarding ${req.method} ${upstreamPath} for ${session.sessionId}`, "info");
     const upstreamReq = https.request(
       {
         hostname: upstreamHost,
@@ -208,20 +353,16 @@ function handleProxy(req, res) {
           ...req.headers,
           host: upstreamHost,
           authorization: `Bearer ${REAL_KEYS[provider]}`,
-          "x-api-key": REAL_KEYS[provider], // Anthropic uses x-api-key
+          "x-api-key": REAL_KEYS[provider],
           "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
         },
       },
       (upstreamRes) => {
-        // Copy status and headers
         res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-
-        // Stream the response back
         upstreamRes.on("data", (chunk) => res.write(chunk));
         upstreamRes.on("end", () => res.end());
       }
     );
-
     upstreamReq.on("error", (err) => {
       log(`Upstream error: ${err.message}`, "error");
       if (!res.headersSent) {
@@ -229,22 +370,21 @@ function handleProxy(req, res) {
         res.end(JSON.stringify({ error: "Upstream API error", detail: err.message }));
       }
     });
-
     if (reqBody) upstreamReq.write(reqBody);
     upstreamReq.end();
   });
 }
 
-// ─── Start server ───
-
+loadSessions();
 const server = http.createServer(handleProxy);
-
+server.on("connect", handleConnect);
 server.listen(PORT, () => {
+  const egress = loadEgressConfig();
   log(`Credential isolation proxy running on port ${PORT}`, "ok");
-  log(`Providers: ${Object.keys(REAL_KEYS).filter((k) => REAL_KEYS[k]).join(", ") || "none configured"}`, "info");
-  log(`Health: http://localhost:${PORT}/health`, "info");
-  if (!REAL_KEYS.anthropic && !REAL_KEYS.openai) {
-    log(`No API keys found. Set ANTHROPIC_API_KEY and/or OPENAI_API_KEY in the environment.`, "warn");
-    log(`The proxy will run but reject all requests until keys are configured.`, "warn");
-  }
+  log(`Session store: ${STORE_PATH}`, "info");
+  log(
+    `Egress: ${egress.active ? "active" : "inactive"} (config=${egress.path || "none"}) allow=${egress.allow.length} deny=${egress.deny.length}`,
+    "info"
+  );
+  log(`Providers: ${Object.keys(REAL_KEYS).filter((k) => REAL_KEYS[k]).join(", ") || "none"}`, "info");
 });
